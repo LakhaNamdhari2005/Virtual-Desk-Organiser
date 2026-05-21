@@ -1,0 +1,1220 @@
+#include <GxEPD2_4C.h>
+#include <Adafruit_GFX.h>
+#include <Fonts/FreeMonoBold18pt7b.h>
+#include <Fonts/FreeMonoBold12pt7b.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include <time.h>
+#include "image.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/semphr.h"
+#include "freertos/queue.h"
+#include "freertos/timers.h"
+#include "esp_task_wdt.h"
+
+// ✅ BLE includes
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
+
+// ─────────────────────────────────────────────
+//  PINS
+// ─────────────────────────────────────────────
+#define CS       5
+#define DC       17
+#define RST      16
+#define BUSY     4
+#define EPD_MOSI 11
+#define EPD_SCK  18
+#define BTN_NEXT 1
+#define BTN_PREV 2
+#define BUZZER   6
+#define PIR_PIN  7
+#define LED_HIGH 38
+#define LED_MID  39
+#define LED_LOW  40
+#define BAT_ADC   3
+
+#define BUZZER_FREQ        4000
+#define BUZZER_RES         8
+#define PIR_INACTIVITY_MS  30000
+#define DOUBLE_PRESS_MS    500
+
+// ─────────────────────────────────────────────
+//  BLE UUIDs — unique IDs for your service
+//  You can keep these or generate new ones at
+//  https://www.uuidgenerator.net/
+// ─────────────────────────────────────────────
+#define BLE_DEVICE_NAME        "SmartDesk"
+#define BLE_SERVICE_UUID       "12345678-1234-1234-1234-123456789abc"
+#define BLE_MSG_CHAR_UUID      "abcdef01-1234-1234-1234-123456789abc"  // Write message
+#define BLE_STATUS_CHAR_UUID   "abcdef02-1234-1234-1234-123456789abc"  // Notify status
+
+// ─────────────────────────────────────────────
+//  PAGE 1 LAYOUT
+// ─────────────────────────────────────────────
+#define P1_BANNER_Y    20
+#define P1_BANNER_H   250
+#define P1_BOX_Y      300
+#define P1_BOX_H      140
+#define P1_INFO_Y     485
+#define P1_INFO_H      55
+#define TIMEBAR_Y     580
+#define TIMEBAR_H      60
+#define DATE_BOX_X      0
+#define DATE_BOX_W    480
+#define TIME_BOX_X    480
+#define TIME_BOX_W    480
+
+// ─────────────────────────────────────────────
+//  PAGES 2/3 LAYOUT
+// ─────────────────────────────────────────────
+#define HEADER_Y        0
+#define HEADER_H      120
+#define REDLINE_Y     120
+#define REDLINE_H      10
+#define CONTENT_BOX_Y 170
+#define CONTENT_BOX_H 390
+#define FOOTER_RED_Y  565
+#define FOOTER_RED_H   15
+
+// ─────────────────────────────────────────────
+//  PAGE 4 LAYOUT
+// ─────────────────────────────────────────────
+#define P4_COL_Y   220
+#define P4_COL_H   355
+#define P4_COL1_X    0
+#define P4_COL1_W  310
+#define P4_COL2_X  315
+#define P4_COL2_W  330
+#define P4_COL3_X  650
+#define P4_COL3_W  310
+
+// ─────────────────────────────────────────────
+//  WIFI & API
+// ─────────────────────────────────────────────
+const char* ssid     = "Singh";
+const char* password = "62841687";
+const char* apiURL   = "https://smartdesk-backend-lovat.vercel.app/api/data";
+
+// ─────────────────────────────────────────────
+//  DISPLAY
+// ─────────────────────────────────────────────
+GxEPD2_4C<GxEPD2_1160c_GDEY116F51, GxEPD2_1160c_GDEY116F51::HEIGHT / 16>
+display(GxEPD2_1160c_GDEY116F51(CS, DC, RST, BUSY));
+
+// ─────────────────────────────────────────────
+//  SHARED DATA
+// ─────────────────────────────────────────────
+#define MAX_TASKS  10
+#define MAX_ALARMS 10
+#define MAX_EVENTS 10
+
+struct TaskItem  { char title[128]; bool done; };
+struct EventItem { int  date; char event[128]; };
+
+struct DeskData {
+  float     temperature;
+  char      weatherText[64];
+  char      city[64];
+  char      humidity[16];
+  char      windSpeed[16];
+  char      quoteText[512];
+  char      messageText[256];
+  char      alarmTime[MAX_ALARMS][16];
+  int       alarmCount;
+  TaskItem  tasks[MAX_TASKS];
+  int       taskCount;
+  EventItem events[MAX_EVENTS];
+  int       eventCount;
+  bool      dataReady;
+};
+DeskData deskData = {};
+
+// ─────────────────────────────────────────────
+//  BLE STATE
+// ─────────────────────────────────────────────
+BLEServer*          pServer         = nullptr;
+BLECharacteristic*  pMsgChar        = nullptr;
+BLECharacteristic*  pStatusChar     = nullptr;
+volatile bool       bleConnected    = false;
+volatile bool       bleNewMessage   = false;  // ✅ flag: new BLE message arrived
+char                bleMessageBuf[256] = "";  // ✅ buffer for BLE message
+
+// ─────────────────────────────────────────────
+//  FREERTOS HANDLES
+// ─────────────────────────────────────────────
+SemaphoreHandle_t dataMutex;
+SemaphoreHandle_t displayMutex;
+SemaphoreHandle_t wifiMutex;
+SemaphoreHandle_t bleMsgMutex;       // ✅ protects bleMessageBuf
+QueueHandle_t     displayQueue;
+TimerHandle_t     timeRefreshTimer;
+TimerHandle_t     apiRefreshTimer;
+
+TaskHandle_t taskAPIHandle;
+TaskHandle_t taskDisplayHandle;
+TaskHandle_t taskBuzzerHandle;
+TaskHandle_t taskAlarmHandle;
+TaskHandle_t taskPIRHandle;
+TaskHandle_t taskBatteryHandle;
+
+// ─────────────────────────────────────────────
+//  DISPLAY COMMANDS
+// ─────────────────────────────────────────────
+typedef enum {
+  CMD_DRAW_PAGE1    = 0,
+  CMD_DRAW_PAGE2    = 1,
+  CMD_DRAW_PAGE3    = 2,
+  CMD_DRAW_PAGE4    = 3,
+  CMD_PARTIAL_TIME  = 4,
+  CMD_PARTIAL_PAGE1 = 5,
+} DisplayCommand;
+
+// ─────────────────────────────────────────────
+//  STATE
+// ─────────────────────────────────────────────
+volatile int  currentPage          = 0;
+volatile bool page1DrawnOnce       = false;
+volatile int  lastContentPage      = -1;
+volatile bool isAlarmActive        = false;
+volatile bool alarmSnoozed         = false;
+volatile unsigned long alarmStartTime   = 0;
+volatile unsigned long snoozeStartTime  = 0;
+volatile unsigned long lastActivityTime = 0;
+
+volatile bool btnNextPressed       = false;
+volatile bool btnPrevPressed       = false;
+volatile bool abortRefresh         = false;
+volatile bool pirSwitchedToMessage = false;
+
+volatile unsigned long lastBtnNextTime  = 0;
+volatile unsigned long lastBtnPrevTime  = 0;
+volatile unsigned long prevBtnNextPress = 0;
+volatile unsigned long prevBtnPrevPress = 0;
+volatile bool          doublePressNext  = false;
+volatile bool          doublePressPrev  = false;
+
+#define DEBOUNCE_MS 300
+
+extern const uint8_t image_black[];
+extern const uint8_t image_red[];
+extern const uint8_t image_yellow[];
+
+// ═════════════════════════════════════════════
+//  DEBUG
+// ═════════════════════════════════════════════
+void dbg(const char* tag, const char* msg) {
+  Serial.printf("[%8lu] [%-12s] %s\n", millis(), tag, msg);
+}
+void dbgf(const char* tag, const char* fmt, ...) {
+  char buf[256];
+  va_list args;
+  va_start(args, fmt);
+  vsnprintf(buf, sizeof(buf), fmt, args);
+  va_end(args);
+  Serial.printf("[%8lu] [%-12s] %s\n", millis(), tag, buf);
+}
+
+// ═════════════════════════════════════════════
+//  BLE CALLBACKS
+// ═════════════════════════════════════════════
+
+// ✅ Connection events
+class MyServerCallbacks : public BLEServerCallbacks {
+  void onConnect(BLEServer* pServer) override {
+    bleConnected = true;
+    dbg("BLE", "Client connected!");
+    // Send welcome status
+    if (pStatusChar) {
+      pStatusChar->setValue("SmartDesk connected!");
+      pStatusChar->notify();
+    }
+  }
+  void onDisconnect(BLEServer* pServer) override {
+    bleConnected = false;
+    dbg("BLE", "Client disconnected — restarting advertising");
+    // ✅ Restart advertising so device is discoverable again
+    BLEDevice::startAdvertising();
+  }
+};
+
+// ✅ Message received from phone
+class MsgCharCallbacks : public BLECharacteristicCallbacks {
+  void onWrite(BLECharacteristic* pCharacteristic) override {
+    String val = pCharacteristic->getValue().c_str();
+    val.trim();
+    if (val.length() == 0) return;
+
+    Serial.println("════════════════════════════════");
+    Serial.println("📱 BLE MESSAGE RECEIVED!");
+    Serial.print("   Raw text : ");
+    Serial.println(val);
+
+    // ✅ Try getLocalTime with retry — BLE callback runs fast
+    char timeStr[16] = "??:??";
+    struct tm timeinfo;
+    // ✅ Retry up to 3 times with small delay
+    for (int i = 0; i < 3; i++) {
+      if (getLocalTime(&timeinfo, 1000)) { // 1000ms timeout
+        strftime(timeStr, sizeof(timeStr), "%H:%M", &timeinfo);
+        break;
+      }
+      delay(100);
+    }
+
+    String formatted = "\"" + val + "\" at " + String(timeStr) + " (BT)";
+
+    Serial.print("   Time     : ");
+    Serial.println(timeStr);
+    Serial.print("   Formatted: ");
+    Serial.println(formatted);
+    Serial.println("════════════════════════════════");
+
+    xSemaphoreTake(dataMutex, portMAX_DELAY);
+    strlcpy(deskData.messageText, formatted.c_str(), 256);
+    xSemaphoreGive(dataMutex);
+
+    bleNewMessage = true;
+
+    if (pStatusChar) {
+      pStatusChar->setValue("OK: " + val.substring(0, 20));
+      pStatusChar->notify();
+    }
+  }
+};
+
+// ═════════════════════════════════════════════
+//  BLE INIT
+// ═════════════════════════════════════════════
+void initBLE() {
+  dbg("BLE", "Initializing BLE...");
+  BLEDevice::init(BLE_DEVICE_NAME);
+
+  pServer = BLEDevice::createServer();
+  pServer->setCallbacks(new MyServerCallbacks());
+
+  BLEService* pService = pServer->createService(BLE_SERVICE_UUID);
+
+  // ── Message characteristic (phone → ESP32) ──
+  pMsgChar = pService->createCharacteristic(
+    BLE_MSG_CHAR_UUID,
+    BLECharacteristic::PROPERTY_WRITE |
+    BLECharacteristic::PROPERTY_WRITE_NR   // no-response write = faster
+  );
+  pMsgChar->setCallbacks(new MsgCharCallbacks());
+
+  // ── Status characteristic (ESP32 → phone, notify) ──
+  pStatusChar = pService->createCharacteristic(
+    BLE_STATUS_CHAR_UUID,
+    BLECharacteristic::PROPERTY_READ  |
+    BLECharacteristic::PROPERTY_NOTIFY
+  );
+  pStatusChar->addDescriptor(new BLE2902());
+  pStatusChar->setValue("SmartDesk Ready");
+
+  pService->start();
+
+  // ── Advertising ──
+  BLEAdvertising* pAdvertising = BLEDevice::getAdvertising();
+  pAdvertising->addServiceUUID(BLE_SERVICE_UUID);
+  pAdvertising->setScanResponse(true);
+  pAdvertising->setMinPreferred(0x06);
+  BLEDevice::startAdvertising();
+
+  dbg("BLE", "BLE started — advertising as 'SmartDesk'");
+}
+
+// ═════════════════════════════════════════════
+//  ISRs
+// ═════════════════════════════════════════════
+void IRAM_ATTR isrBtnNext() {
+  unsigned long now = millis();
+  if (now - lastBtnNextTime > DEBOUNCE_MS) {
+    if (now - prevBtnNextPress < DOUBLE_PRESS_MS) {
+      doublePressNext = true;
+    } else {
+      lastActivityTime     = now;
+      pirSwitchedToMessage = false;
+      btnNextPressed       = true;
+      abortRefresh         = true;
+      BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+      DisplayCommand cmd = CMD_DRAW_PAGE2;
+      xQueueSendFromISR(displayQueue, &cmd, &xHigherPriorityTaskWoken);
+      portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+    }
+    prevBtnNextPress = now;
+    lastBtnNextTime  = now;
+  }
+}
+
+void IRAM_ATTR isrBtnPrev() {
+  unsigned long now = millis();
+  if (now - lastBtnPrevTime > DEBOUNCE_MS) {
+    if (now - prevBtnPrevPress < DOUBLE_PRESS_MS) {
+      doublePressPrev = true;
+    } else {
+      lastActivityTime     = now;
+      pirSwitchedToMessage = false;
+      btnPrevPressed       = true;
+      abortRefresh         = true;
+      BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+      DisplayCommand cmd = CMD_DRAW_PAGE1;
+      xQueueSendFromISR(displayQueue, &cmd, &xHigherPriorityTaskWoken);
+      portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+    }
+    prevBtnPrevPress = now;
+    lastBtnPrevTime  = now;
+  }
+}
+
+// ═════════════════════════════════════════════
+//  WIFI
+// ═════════════════════════════════════════════
+void connectWiFi() {
+  if (WiFi.status() == WL_CONNECTED) { dbg("WIFI", "Already connected"); return; }
+  dbgf("WIFI", "Connecting to: %s", ssid);
+  WiFi.disconnect(true);
+  vTaskDelay(pdMS_TO_TICKS(500));
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  WiFi.setTxPower(WIFI_POWER_19_5dBm);
+  WiFi.begin(ssid, password);
+  int retries = 0;
+  while (WiFi.status() != WL_CONNECTED && retries < 40) {
+    vTaskDelay(pdMS_TO_TICKS(500));
+    dbgf("WIFI", "Attempt %d/40 status:%d", ++retries, WiFi.status());
+  }
+  if (WiFi.status() == WL_CONNECTED)
+    dbgf("WIFI", "Connected! IP:%s RSSI:%d",
+         WiFi.localIP().toString().c_str(), WiFi.RSSI());
+  else
+    dbg("WIFI", "ERROR — Failed");
+}
+
+// ═════════════════════════════════════════════
+//  ABORT MACRO
+// ═════════════════════════════════════════════
+#define CHECK_ABORT() if (abortRefresh) { \
+  display.setFullWindow(); \
+  xSemaphoreGive(displayMutex); \
+  return; \
+}
+
+// ═════════════════════════════════════════════
+//  TEXT HELPERS
+// ═════════════════════════════════════════════
+void drawTextWrapped(const char* text, int x, int y, int maxWidth) {
+  display.setFont(&FreeMonoBold18pt7b);
+  display.setTextColor(GxEPD_BLACK);
+  String txt = String(text), line = "", word = "";
+  for (int i = 0; i <= (int)txt.length(); i++) {
+    char c = (i < (int)txt.length()) ? txt[i] : ' ';
+    if (c == ' ') {
+      String testLine = line + word + " ";
+      int16_t x1, y1; uint16_t w, h;
+      display.getTextBounds(testLine, 0, 0, &x1, &y1, &w, &h);
+      if (w > maxWidth && line.length() > 0) {
+        display.setCursor(x, y); display.print(line);
+        line = word + " "; y += 45;
+      } else { line = testLine; }
+      word = "";
+    } else { word += c; }
+  }
+  if (line.length() > 0) { display.setCursor(x, y); display.print(line); }
+}
+
+// ═════════════════════════════════════════════
+//  DATE / TIME BOXES
+// ═════════════════════════════════════════════
+void drawDateBox(struct tm timeinfo) {
+  char dateStr[32];
+  strftime(dateStr, sizeof(dateStr), "%d  %b  %Y", &timeinfo);
+  display.fillRect(DATE_BOX_X, TIMEBAR_Y, DATE_BOX_W, TIMEBAR_H, GxEPD_BLACK);
+  display.fillRect(DATE_BOX_W, TIMEBAR_Y, 4, TIMEBAR_H, GxEPD_RED);
+  display.setFont(&FreeMonoBold18pt7b);
+  display.setTextColor(GxEPD_WHITE);
+  int16_t x1, y1; uint16_t w, h;
+  display.getTextBounds(dateStr, 0, 0, &x1, &y1, &w, &h);
+  display.setCursor(DATE_BOX_X + (DATE_BOX_W - w) / 2, TIMEBAR_Y + 42);
+  display.print(dateStr);
+}
+
+void drawTimeBox(struct tm timeinfo) {
+  char timeStr[16];
+  strftime(timeStr, sizeof(timeStr), "%H:%M", &timeinfo);
+  display.fillRect(TIME_BOX_X, TIMEBAR_Y, TIME_BOX_W, TIMEBAR_H, GxEPD_RED);
+  display.setFont(&FreeMonoBold18pt7b);
+  display.setTextColor(GxEPD_WHITE);
+  int16_t x1, y1; uint16_t w, h;
+  display.getTextBounds(timeStr, 0, 0, &x1, &y1, &w, &h);
+  display.setCursor(TIME_BOX_X + (TIME_BOX_W - w) / 2, TIMEBAR_Y + 42);
+  display.print(timeStr);
+}
+
+void drawInfoBar(const char* humidity, const char* windSpeed) {
+  display.fillRect(0, P1_INFO_Y, 960, P1_INFO_H, GxEPD_BLACK);
+  display.fillRect(480, P1_INFO_Y, 4, P1_INFO_H, GxEPD_RED);
+  display.setFont(&FreeMonoBold18pt7b);
+  display.setTextColor(GxEPD_YELLOW);
+  display.setCursor(30, P1_INFO_Y + 38);
+  display.print("Humidity: ");
+  display.setTextColor(GxEPD_WHITE);
+  display.print(humidity);
+  display.setTextColor(GxEPD_YELLOW);
+  display.setCursor(500, P1_INFO_Y + 38);
+  display.print("Wind: ");
+  display.setTextColor(GxEPD_WHITE);
+  display.print(windSpeed);
+}
+
+void refreshTimeBoxOnly() {
+  struct tm timeinfo;
+  getLocalTime(&timeinfo);
+  abortRefresh = false;
+  xSemaphoreTake(displayMutex, portMAX_DELAY);
+  display.setPartialWindow(TIME_BOX_X, TIMEBAR_Y, TIME_BOX_W, TIMEBAR_H);
+  display.firstPage();
+  do {
+    CHECK_ABORT();
+    drawTimeBox(timeinfo);
+  } while (display.nextPage());
+  xSemaphoreGive(displayMutex);
+}
+
+// ═════════════════════════════════════════════
+//  PAGE 1 — FULL
+// ═════════════════════════════════════════════
+void drawPage1Full() {
+  dbg("PAGE1", "Full draw");
+  struct tm timeinfo;
+  getLocalTime(&timeinfo);
+  xSemaphoreTake(dataMutex, portMAX_DELAY);
+  float temp = deskData.temperature;
+  char  weather[64], cty[64], humidity[16], windSpeed[16];
+  strlcpy(weather,   deskData.weatherText, 64);
+  strlcpy(cty,       deskData.city,        64);
+  strlcpy(humidity,  deskData.humidity,    16);
+  strlcpy(windSpeed, deskData.windSpeed,   16);
+  xSemaphoreGive(dataMutex);
+
+  abortRefresh = false;
+  xSemaphoreTake(displayMutex, portMAX_DELAY);
+  display.setFullWindow();
+  display.firstPage();
+  do {
+    CHECK_ABORT();
+    display.fillScreen(GxEPD_WHITE);
+    display.drawBitmap(20, P1_BANNER_Y, image_black,  920, P1_BANNER_H, GxEPD_BLACK);
+    display.drawBitmap(20, P1_BANNER_Y, image_red,    920, P1_BANNER_H, GxEPD_RED);
+    display.drawBitmap(20, P1_BANNER_Y, image_yellow, 920, P1_BANNER_H, GxEPD_YELLOW);
+    display.fillRect(20, P1_BOX_Y, 450, P1_BOX_H, GxEPD_RED);
+    display.setFont(&FreeMonoBold18pt7b);
+    display.setTextColor(GxEPD_WHITE);
+    display.setCursor(40, P1_BOX_Y + 60);
+    display.printf("Temp: %.1f C", temp);
+    display.setCursor(40, P1_BOX_Y + 115);
+    display.print(weather);
+    display.fillRect(490, P1_BOX_Y, 450, P1_BOX_H, GxEPD_YELLOW);
+    display.setTextColor(GxEPD_BLACK);
+    display.setCursor(510, P1_BOX_Y + 60);
+    display.print("Smart Desk");
+    display.setCursor(510, P1_BOX_Y + 115);
+    display.print(cty);
+    drawInfoBar(humidity, windSpeed);
+    drawDateBox(timeinfo);
+    drawTimeBox(timeinfo);
+  } while (display.nextPage());
+  xSemaphoreGive(displayMutex);
+  page1DrawnOnce  = true;
+  lastContentPage = 0;
+}
+
+// ═════════════════════════════════════════════
+//  PAGE 1 — PARTIAL
+// ═════════════════════════════════════════════
+void drawPage1Partial() {
+  dbg("PAGE1", "Partial");
+  struct tm timeinfo;
+  getLocalTime(&timeinfo);
+  xSemaphoreTake(dataMutex, portMAX_DELAY);
+  float temp = deskData.temperature;
+  char  weather[64], cty[64], humidity[16], windSpeed[16];
+  strlcpy(weather,   deskData.weatherText, 64);
+  strlcpy(cty,       deskData.city,        64);
+  strlcpy(humidity,  deskData.humidity,    16);
+  strlcpy(windSpeed, deskData.windSpeed,   16);
+  xSemaphoreGive(dataMutex);
+
+  abortRefresh = false;
+  xSemaphoreTake(displayMutex, portMAX_DELAY);
+
+  display.setPartialWindow(20, P1_BOX_Y, 450, P1_BOX_H);
+  display.firstPage();
+  do {
+    CHECK_ABORT();
+    display.fillRect(20, P1_BOX_Y, 450, P1_BOX_H, GxEPD_RED);
+    display.setFont(&FreeMonoBold18pt7b);
+    display.setTextColor(GxEPD_WHITE);
+    display.setCursor(40, P1_BOX_Y + 60);
+    display.printf("Temp: %.1f C", temp);
+    display.setCursor(40, P1_BOX_Y + 115);
+    display.print(weather);
+  } while (display.nextPage());
+  if (abortRefresh) { xSemaphoreGive(displayMutex); return; }
+
+  display.setPartialWindow(490, P1_BOX_Y, 450, P1_BOX_H);
+  display.firstPage();
+  do {
+    CHECK_ABORT();
+    display.fillRect(490, P1_BOX_Y, 450, P1_BOX_H, GxEPD_YELLOW);
+    display.setFont(&FreeMonoBold18pt7b);
+    display.setTextColor(GxEPD_BLACK);
+    display.setCursor(510, P1_BOX_Y + 60);
+    display.print("Smart Desk");
+    display.setCursor(510, P1_BOX_Y + 115);
+    display.print(cty);
+  } while (display.nextPage());
+  if (abortRefresh) { xSemaphoreGive(displayMutex); return; }
+
+  display.setPartialWindow(0, P1_INFO_Y, 960, P1_INFO_H);
+  display.firstPage();
+  do {
+    CHECK_ABORT();
+    drawInfoBar(humidity, windSpeed);
+  } while (display.nextPage());
+  if (abortRefresh) { xSemaphoreGive(displayMutex); return; }
+
+  display.setPartialWindow(TIME_BOX_X, TIMEBAR_Y, TIME_BOX_W, TIMEBAR_H);
+  display.firstPage();
+  do {
+    CHECK_ABORT();
+    drawTimeBox(timeinfo);
+  } while (display.nextPage());
+  xSemaphoreGive(displayMutex);
+}
+
+// ═════════════════════════════════════════════
+//  PAGE 2 — QUOTE
+// ═════════════════════════════════════════════
+void drawPage2() {
+  dbg("PAGE2", "Start");
+  xSemaphoreTake(dataMutex, portMAX_DELAY);
+  char quote[512];
+  strlcpy(quote, deskData.quoteText, sizeof(quote));
+  xSemaphoreGive(dataMutex);
+  struct tm timeinfo; getLocalTime(&timeinfo);
+  abortRefresh = false;
+  xSemaphoreTake(displayMutex, portMAX_DELAY);
+  display.setFullWindow();
+  display.firstPage();
+  do {
+    CHECK_ABORT();
+    display.fillScreen(GxEPD_WHITE);
+    display.fillRect(0, HEADER_Y, 960, HEADER_H, GxEPD_YELLOW);
+    display.setFont(&FreeMonoBold18pt7b);
+    display.setTextColor(GxEPD_BLACK);
+    int16_t x1, y1; uint16_t w, h;
+    display.getTextBounds("QUOTE OF THE DAY", 0, 0, &x1, &y1, &w, &h);
+    display.setCursor((960 - w) / 2, 80);
+    display.print("QUOTE OF THE DAY");
+    display.fillRect(0, REDLINE_Y, 960, REDLINE_H, GxEPD_RED);
+    display.fillRect(40, CONTENT_BOX_Y, 880, CONTENT_BOX_H, GxEPD_WHITE);
+    display.drawRect(40, CONTENT_BOX_Y, 880, CONTENT_BOX_H, GxEPD_BLACK);
+    drawTextWrapped(quote, 70, CONTENT_BOX_Y + 80, 820);
+    display.fillRect(0, FOOTER_RED_Y, 960, FOOTER_RED_H, GxEPD_RED);
+    drawDateBox(timeinfo); drawTimeBox(timeinfo);
+  } while (display.nextPage());
+  xSemaphoreGive(displayMutex);
+  lastContentPage = 2;
+}
+
+// ═════════════════════════════════════════════
+//  PAGE 3 — MESSAGE
+//  ✅ Shows BLE badge if message came via BLE
+// ═════════════════════════════════════════════
+void drawPage3() {
+  dbg("PAGE3", "Start");
+  xSemaphoreTake(dataMutex, portMAX_DELAY);
+  char msg[256];
+  strlcpy(msg, deskData.messageText, sizeof(msg));
+  xSemaphoreGive(dataMutex);
+
+  // ✅ Detect if BLE message (contains "(BT)" suffix)
+  bool isBLE = (strstr(msg, "(BT)") != nullptr);
+
+  struct tm timeinfo; getLocalTime(&timeinfo);
+  abortRefresh = false;
+  xSemaphoreTake(displayMutex, portMAX_DELAY);
+  display.setFullWindow();
+  display.firstPage();
+  do {
+    CHECK_ABORT();
+    display.fillScreen(GxEPD_WHITE);
+    display.fillRect(0, HEADER_Y, 960, HEADER_H, GxEPD_YELLOW);
+    display.setFont(&FreeMonoBold18pt7b);
+    display.setTextColor(GxEPD_BLACK);
+
+    // ✅ Header changes based on source
+    const char* headerTitle = isBLE ? "BLUETOOTH MESSAGE" : "NEW MESSAGE";
+    int16_t x1, y1; uint16_t w, h;
+    display.getTextBounds(headerTitle, 0, 0, &x1, &y1, &w, &h);
+    display.setCursor((960 - w) / 2, 80);
+    display.print(headerTitle);
+
+    // ✅ Small BLE badge on header if BLE message
+    if (isBLE) {
+      display.fillRect(860, 10, 90, 30, GxEPD_BLACK);
+      display.setFont(&FreeMonoBold12pt7b);
+      display.setTextColor(GxEPD_YELLOW);
+      display.setCursor(865, 32);
+      display.print("BLE");
+    }
+
+    display.fillRect(0, REDLINE_Y, 960, REDLINE_H, GxEPD_RED);
+    display.fillRect(40, CONTENT_BOX_Y, 880, CONTENT_BOX_H, GxEPD_WHITE);
+    display.drawRect(40, CONTENT_BOX_Y, 880, CONTENT_BOX_H, GxEPD_BLACK);
+    drawTextWrapped(msg, 70, CONTENT_BOX_Y + 80, 820);
+    display.fillRect(0, FOOTER_RED_Y, 960, FOOTER_RED_H, GxEPD_RED);
+    drawDateBox(timeinfo); drawTimeBox(timeinfo);
+  } while (display.nextPage());
+  xSemaphoreGive(displayMutex);
+  lastContentPage = 3;
+  dbg("PAGE3", "Done");
+}
+
+// ═════════════════════════════════════════════
+//  PAGE 4 — DESK ORGANISER
+// ═════════════════════════════════════════════
+void drawPage4() {
+  dbg("PAGE4", "Start");
+  xSemaphoreTake(dataMutex, portMAX_DELAY);
+  TaskItem  localTasks[MAX_TASKS];
+  int taskCount = deskData.taskCount;
+  for (int i = 0; i < taskCount; i++) localTasks[i] = deskData.tasks[i];
+  char localAlarms[MAX_ALARMS][16];
+  int alarmCount = deskData.alarmCount;
+  for (int i = 0; i < alarmCount; i++)
+    strlcpy(localAlarms[i], deskData.alarmTime[i], 16);
+  EventItem localEvents[MAX_EVENTS];
+  int eventCount = deskData.eventCount;
+  for (int i = 0; i < eventCount; i++) localEvents[i] = deskData.events[i];
+  xSemaphoreGive(dataMutex);
+  struct tm timeinfo; getLocalTime(&timeinfo);
+  char monthStr[12];
+  strftime(monthStr, sizeof(monthStr), "%b", &timeinfo);
+
+  abortRefresh = false;
+  xSemaphoreTake(displayMutex, portMAX_DELAY);
+  display.setFullWindow();
+  display.firstPage();
+  do {
+    CHECK_ABORT();
+    display.fillScreen(GxEPD_WHITE);
+    display.drawBitmap(20, 5, image_black,  920, 210, GxEPD_BLACK);
+    display.drawBitmap(20, 5, image_red,    920, 210, GxEPD_RED);
+    display.drawBitmap(20, 5, image_yellow, 920, 210, GxEPD_YELLOW);
+    display.drawRect(P4_COL1_X, P4_COL_Y, P4_COL1_W, P4_COL_H, GxEPD_BLACK);
+    display.drawRect(P4_COL2_X, P4_COL_Y, P4_COL2_W, P4_COL_H, GxEPD_BLACK);
+    display.drawRect(P4_COL3_X, P4_COL_Y, P4_COL3_W, P4_COL_H, GxEPD_BLACK);
+    display.fillRect(P4_COL1_X, P4_COL_Y, P4_COL1_W, 40, GxEPD_RED);
+    display.setFont(&FreeMonoBold12pt7b);
+    display.setTextColor(GxEPD_WHITE);
+    display.setCursor(P4_COL1_X + 10, P4_COL_Y + 28);
+    display.print("TO DO LIST");
+    int ty = P4_COL_Y + 70;
+    for (int i = 0; i < min(taskCount, 7); i++) {
+      display.drawRect(P4_COL1_X + 8, ty - 18, 18, 18, GxEPD_BLACK);
+      if (localTasks[i].done) {
+        display.drawLine(P4_COL1_X + 10, ty - 9,  P4_COL1_X + 14, ty - 4,  GxEPD_BLACK);
+        display.drawLine(P4_COL1_X + 14, ty - 4,  P4_COL1_X + 24, ty - 16, GxEPD_BLACK);
+      }
+      display.setFont(&FreeMonoBold12pt7b);
+      display.setTextColor(GxEPD_BLACK);
+      display.setCursor(P4_COL1_X + 32, ty);
+      String t = String(localTasks[i].title);
+      if (t.length() > 16) t = t.substring(0, 15) + ".";
+      display.print(t);
+      ty += 42;
+    }
+    display.fillRect(P4_COL2_X, P4_COL_Y, P4_COL2_W, 40, GxEPD_YELLOW);
+    display.setFont(&FreeMonoBold12pt7b);
+    display.setTextColor(GxEPD_BLACK);
+    display.setCursor(P4_COL2_X + 8, P4_COL_Y + 28);
+    display.print("UPCOMING EVENTS");
+    int ey = P4_COL_Y + 60;
+    for (int i = 0; i < min(eventCount, 4); i++) {
+      display.fillRect(P4_COL2_X + 6, ey, 50, 55, GxEPD_YELLOW);
+      display.setFont(&FreeMonoBold12pt7b);
+      display.setTextColor(GxEPD_BLACK);
+      display.setCursor(P4_COL2_X + 10, ey + 18);
+      display.print(monthStr);
+      display.setFont(&FreeMonoBold18pt7b);
+      display.setCursor(P4_COL2_X + 10, ey + 50);
+      display.printf("%02d", localEvents[i].date);
+      display.setFont(&FreeMonoBold12pt7b);
+      display.setCursor(P4_COL2_X + 65, ey + 30);
+      String ev = String(localEvents[i].event);
+      if (ev.length() > 18) ev = ev.substring(0, 17) + ".";
+      display.print(ev);
+      ey += 72;
+      if (i < min(eventCount, 4) - 1)
+        display.drawLine(P4_COL2_X + 4, ey - 5,
+                         P4_COL2_X + P4_COL2_W - 8, ey - 5, GxEPD_BLACK);
+    }
+    display.fillRect(P4_COL3_X, P4_COL_Y, P4_COL3_W, 40, GxEPD_RED);
+    display.setFont(&FreeMonoBold12pt7b);
+    display.setTextColor(GxEPD_WHITE);
+    display.setCursor(P4_COL3_X + 10, P4_COL_Y + 28);
+    display.print("ALARMS SET");
+    int ay = P4_COL_Y + 68;
+    for (int i = 0; i < min(alarmCount, 7); i++) {
+      display.drawCircle(P4_COL3_X + 18, ay - 6, 10, GxEPD_RED);
+      display.drawLine(P4_COL3_X + 18, ay - 6, P4_COL3_X + 18, ay - 14, GxEPD_RED);
+      display.drawLine(P4_COL3_X + 18, ay - 6, P4_COL3_X + 25, ay - 6,  GxEPD_RED);
+      display.setFont(&FreeMonoBold12pt7b);
+      display.setTextColor(GxEPD_BLACK);
+      display.setCursor(P4_COL3_X + 34, ay);
+      display.print(localAlarms[i]);
+      ay += 42;
+    }
+    drawDateBox(timeinfo); drawTimeBox(timeinfo);
+  } while (display.nextPage());
+  xSemaphoreGive(displayMutex);
+  lastContentPage = 4;
+  page1DrawnOnce  = false;
+}
+
+// ═════════════════════════════════════════════
+//  BATTERY TASK
+// ═════════════════════════════════════════════
+void taskBattery(void* pvParameters) {
+  dbg("TASK_BAT", "Started");
+  vTaskDelay(pdMS_TO_TICKS(2000));
+
+  for (;;) {
+    long adcSum = 0;
+    for (int i = 0; i < 10; i++) {
+      adcSum += analogRead(BAT_ADC);
+      vTaskDelay(pdMS_TO_TICKS(20));
+    }
+    int adcVal = adcSum / 10;
+
+    // ✅ ESP32-S3 ADC with 11dB attenuation:
+    // Full scale = 3.1V (not 3.3V) — hardware characteristic
+    // Voltage divider 100k + 47k:
+    // Vbat = Vadc × (100+47)/47
+    // But for 600mAh LiPo: full=4.2V, empty=3.0V
+    // At full: Vadc = 4.2 × 47/147 = 1.34V → ADC ≈ 1768
+    // At empty: Vadc = 3.0 × 47/147 = 0.96V → ADC ≈ 1267
+
+    // ✅ Use direct ADC mapping — calibrated for your divider
+    // Map ADC 1267(empty) to 1768(full) → 0% to 100%
+    float pct = ((float)(adcVal - 1267) / (1768.0f - 1267.0f)) * 100.0f;
+    if (pct > 100.0f) pct = 100.0f;
+    if (pct < 0.0f)   pct = 0.0f;
+
+    // Also calculate voltage for debug
+    float vadc = (adcVal / 4095.0f) * 3.1f;  // 3.1V full scale for 11dB
+    float vbat = vadc * (147.0f / 47.0f);
+
+    dbgf("TASK_BAT", "ADC:%d  Vadc:%.2fV  Vbat:%.2fV  Pct:%.0f%%",
+         adcVal, vadc, vbat, pct);
+
+    if (pct > 70.0f) {
+      digitalWrite(LED_HIGH, HIGH);
+      digitalWrite(LED_MID,  LOW);
+      digitalWrite(LED_LOW,  LOW);
+      dbg("TASK_BAT", "Battery: HIGH (green)");
+    } else if (pct > 30.0f) {
+      digitalWrite(LED_HIGH, LOW);
+      digitalWrite(LED_MID,  HIGH);
+      digitalWrite(LED_LOW,  LOW);
+      dbg("TASK_BAT", "Battery: MID (yellow)");
+    } else {
+      dbg("TASK_BAT", "Battery: LOW (red blinking)");
+      for (int b = 0; b < 3; b++) {
+        digitalWrite(LED_HIGH, LOW);
+        digitalWrite(LED_MID,  LOW);
+        digitalWrite(LED_LOW,  HIGH);
+        vTaskDelay(pdMS_TO_TICKS(300));
+        digitalWrite(LED_LOW,  LOW);
+        vTaskDelay(pdMS_TO_TICKS(300));
+      }
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(30000));
+  }
+}
+
+// ═════════════════════════════════════════════
+//  TIMER CALLBACKS
+// ═════════════════════════════════════════════
+void timerTimeRefreshCallback(TimerHandle_t xTimer) {
+  DisplayCommand cmd = CMD_PARTIAL_TIME;
+  xQueueSend(displayQueue, &cmd, 0);
+}
+void timerAPIRefreshCallback(TimerHandle_t xTimer) {
+  vTaskResume(taskAPIHandle);
+}
+
+// ═════════════════════════════════════════════
+//  FETCH
+// ═════════════════════════════════════════════
+bool fetchAndStore() {
+  dbg("FETCH", "===== START =====");
+  unsigned long t0 = millis();
+  xSemaphoreTake(wifiMutex, portMAX_DELAY);
+  connectWiFi();
+  if (WiFi.status() != WL_CONNECTED) {
+    dbg("FETCH", "ERROR — WiFi not connected");
+    xSemaphoreGive(wifiMutex); return false;
+  }
+  HTTPClient http;
+  http.begin(apiURL);
+  http.setTimeout(10000);
+  http.setConnectTimeout(5000);
+  int code = http.GET();
+  if (code != 200) {
+    dbgf("FETCH", "ERROR code:%d", code);
+    http.end(); xSemaphoreGive(wifiMutex); return false;
+  }
+  String payload = http.getString();
+  http.end();
+  xSemaphoreGive(wifiMutex);
+
+  StaticJsonDocument<8192> doc;
+  if (deserializeJson(doc, payload)) { dbg("FETCH", "JSON ERR"); return false; }
+
+  xSemaphoreTake(dataMutex, portMAX_DELAY);
+  deskData.temperature = doc["weather"]["temp"].as<float>();
+  strlcpy(deskData.weatherText, doc["weather"]["condition"].as<String>().c_str(), 64);
+  strlcpy(deskData.city,        doc["weather"]["city"].as<String>().c_str(),      64);
+  strlcpy(deskData.quoteText,   doc["quotes"].as<String>().c_str(),               512);
+  snprintf(deskData.humidity,  16, "%d%%",    doc["weather"]["humidity"].as<int>());
+  snprintf(deskData.windSpeed, 16, "%d km/h", doc["weather"]["wind"].as<int>());
+
+  JsonArray alarms = doc["alarms"];
+  deskData.alarmCount = 0;
+  for (int i = 0; i < (int)alarms.size() && i < MAX_ALARMS; i++)
+    strlcpy(deskData.alarmTime[deskData.alarmCount++], alarms[i].as<String>().c_str(), 16);
+
+  JsonArray tasks = doc["tasks"];
+  deskData.taskCount = 0;
+  for (int i = 0; i < (int)tasks.size() && i < MAX_TASKS; i++) {
+    strlcpy(deskData.tasks[deskData.taskCount].title, tasks[i]["title"].as<String>().c_str(), 128);
+    deskData.tasks[deskData.taskCount].done = tasks[i]["done"].as<bool>();
+    deskData.taskCount++;
+  }
+
+  JsonArray cal = doc["calendarEvents"];
+  deskData.eventCount = 0;
+  for (int i = 0; i < (int)cal.size() && deskData.eventCount < MAX_EVENTS; i++) {
+    int dateNum = cal[i]["date"].as<int>();
+    JsonArray evts = cal[i]["events"];
+    for (int j = 0; j < (int)evts.size() && deskData.eventCount < MAX_EVENTS; j++) {
+      deskData.events[deskData.eventCount].date = dateNum;
+      strlcpy(deskData.events[deskData.eventCount].event, evts[j].as<String>().c_str(), 128);
+      deskData.eventCount++;
+    }
+  }
+
+  // ✅ Only overwrite messageText from API if NO BLE message present
+  // BLE messages are preserved until next API message or reboot
+  bool hasBLEMsg = (strstr(deskData.messageText, "(BT)") != nullptr);
+  if (!hasBLEMsg) {
+    JsonArray msgs = doc["deskMessages"];
+    strlcpy(deskData.messageText, "No messages", 256);
+    for (int i = msgs.size() - 1; i >= 0; i--) {
+      JsonObject msg = msgs[i];
+      if (!msg["isDesk"].as<bool>() && msg["text"].as<String>() != "Message received ") {
+        String m = "\"" + msg["text"].as<String>() + "\" at " + msg["time"].as<String>();
+        strlcpy(deskData.messageText, m.c_str(), 256);
+        break;
+      }
+    }
+  } else {
+    dbg("FETCH", "BLE message present — keeping it, skipping API message");
+  }
+
+  deskData.dataReady = true;
+  xSemaphoreGive(dataMutex);
+  dbgf("FETCH", "===== DONE in %lu ms =====", millis() - t0);
+  return true;
+}
+
+// ═════════════════════════════════════════════
+//  TASK: PIR
+// ═════════════════════════════════════════════
+void taskPIR(void* pvParameters) {
+  dbg("TASK_PIR", "Started");
+  lastActivityTime = millis();
+  for (;;) {
+    int motion = digitalRead(PIR_PIN);
+    if (motion == HIGH) {
+      if (pirSwitchedToMessage) pirSwitchedToMessage = false;
+      lastActivityTime = millis();
+    } else {
+      if ((millis() - lastActivityTime >= PIR_INACTIVITY_MS) && !pirSwitchedToMessage) {
+        pirSwitchedToMessage = true;
+        if (currentPage != 2) {
+          currentPage = 2;
+          DisplayCommand cmd = CMD_DRAW_PAGE3;
+          xQueueSend(displayQueue, &cmd, 0);
+        }
+      }
+    }
+    vTaskDelay(pdMS_TO_TICKS(500));
+  }
+}
+
+// ═════════════════════════════════════════════
+//  TASK: API
+// ═════════════════════════════════════════════
+void taskAPI(void* pvParameters) {
+  dbg("TASK_API", "Started");
+
+  // ✅ Subscribe this task to watchdog with long timeout
+  
+
+  bool ok = false;
+  while (!ok) {
+    ok = fetchAndStore();
+    if (!ok) {
+      dbg("TASK_API", "Retry 5s");
+      vTaskDelay(pdMS_TO_TICKS(5000));
+    }
+  }
+
+  DisplayCommand cmd = CMD_DRAW_PAGE1;
+  xQueueSend(displayQueue, &cmd, portMAX_DELAY);
+  xTimerStart(timeRefreshTimer, 0);
+  xTimerStart(apiRefreshTimer,  0);
+
+  for (;;) {
+    esp_task_wdt_reset(); // ✅ feed watchdog before suspend
+    vTaskSuspend(NULL);
+    esp_task_wdt_reset(); // ✅ feed watchdog after wakeup
+    bool result = fetchAndStore();
+    if (result && currentPage == 0) {
+      DisplayCommand c = CMD_PARTIAL_PAGE1;
+      xQueueSend(displayQueue, &c, 0);
+    }
+    if (bleNewMessage) {
+      bleNewMessage = false;
+      currentPage   = 2;
+      DisplayCommand bc = CMD_DRAW_PAGE3;
+      xQueueSend(displayQueue, &bc, 0);
+    }
+  }
+}
+
+// ═════════════════════════════════════════════
+//  TASK: DISPLAY
+// ═════════════════════════════════════════════
+void taskDisplay(void* pvParameters) {
+  dbg("TASK_DISP", "Started");
+  for (;;) {
+    // ✅ Check bleNewMessage even when idle
+    if (bleNewMessage) {
+      bleNewMessage = false;
+      currentPage   = 2;
+      dbg("TASK_DISP", "BLE message → drawing page 3");
+      drawPage3();
+      continue;
+    }
+
+    DisplayCommand cmd;
+    if (xQueueReceive(displayQueue, &cmd, pdMS_TO_TICKS(500))) {
+      dbgf("TASK_DISP", "CMD:%d page:%d", (int)cmd, currentPage);
+
+      if (btnNextPressed || btnPrevPressed) {
+        DisplayCommand discard;
+        while (xQueueReceive(displayQueue, &discard, 0) == pdTRUE) {}
+        if (btnNextPressed) {
+          currentPage    = (currentPage + 1) % 4;
+          btnNextPressed = false;
+        } else {
+          currentPage    = (currentPage - 1 < 0) ? 3 : currentPage - 1;
+          btnPrevPressed = false;
+        }
+        cmd = (DisplayCommand)currentPage;
+        abortRefresh = false;
+      }
+
+      switch (cmd) {
+        case CMD_DRAW_PAGE1:
+          currentPage = 0;
+          if (!page1DrawnOnce || lastContentPage != 0) drawPage1Full();
+          else drawPage1Partial();
+          break;
+        case CMD_PARTIAL_PAGE1:
+          if (page1DrawnOnce) drawPage1Partial(); else drawPage1Full();
+          break;
+        case CMD_PARTIAL_TIME:
+          refreshTimeBoxOnly();
+          break;
+        case CMD_DRAW_PAGE2:
+          currentPage = 1; drawPage2(); break;
+        case CMD_DRAW_PAGE3:
+          currentPage = 2; drawPage3(); break;
+        case CMD_DRAW_PAGE4:
+          currentPage = 3; drawPage4(); break;
+      }
+    }
+  }
+}
+
+// ═════════════════════════════════════════════
+//  TASK: BUZZER
+// ═════════════════════════════════════════════
+void taskBuzzer(void* pvParameters) {
+  dbg("TASK_BUZ", "Started");
+  for (;;) {
+    if (doublePressNext && isAlarmActive) {
+      doublePressNext = false; isAlarmActive = false; alarmSnoozed = false;
+      ledcWrite(BUZZER, 0); dbg("TASK_BUZ", "ALARM STOPPED");
+    }
+    if (doublePressPrev && isAlarmActive) {
+      doublePressPrev = false; alarmSnoozed = true; snoozeStartTime = millis();
+      ledcWrite(BUZZER, 0); dbg("TASK_BUZ", "ALARM SNOOZED 1 min");
+    }
+    if (alarmSnoozed && (millis() - snoozeStartTime >= 60000)) {
+      alarmSnoozed = false; isAlarmActive = true; alarmStartTime = millis();
+      dbg("TASK_BUZ", "SNOOZE EXPIRED — re-ring");
+    }
+    if (isAlarmActive && !alarmSnoozed) {
+      unsigned long el = millis() - alarmStartTime;
+      if (el < 60000) {
+        ledcWrite(BUZZER, 127); vTaskDelay(pdMS_TO_TICKS(200));
+        ledcWrite(BUZZER, 0);   vTaskDelay(pdMS_TO_TICKS(800));
+      } else {
+        isAlarmActive = false; ledcWrite(BUZZER, 0);
+        dbg("TASK_BUZ", "Auto-ended");
+        vTaskDelay(pdMS_TO_TICKS(100));
+      }
+    } else {
+      if (doublePressNext) doublePressNext = false;
+      if (doublePressPrev) doublePressPrev = false;
+      vTaskDelay(pdMS_TO_TICKS(100));
+    }
+  }
+}
+
+// ═════════════════════════════════════════════
+//  TASK: ALARM
+// ═════════════════════════════════════════════
+void taskAlarm(void* pvParameters) {
+  dbg("TASK_ALM", "Started");
+  for (;;) {
+    struct tm timeinfo;
+    if (getLocalTime(&timeinfo)) {
+      char currentTime[10];
+      strftime(currentTime, sizeof(currentTime), "%I:%M %p", &timeinfo);
+      xSemaphoreTake(dataMutex, portMAX_DELAY);
+      bool match = false;
+      for (int i = 0; i < deskData.alarmCount; i++)
+        if (strcmp(deskData.alarmTime[i], currentTime) == 0) { match = true; break; }
+      xSemaphoreGive(dataMutex);
+      if (match && !isAlarmActive && !alarmSnoozed) {
+        isAlarmActive = true; alarmStartTime = millis();
+        dbg("TASK_ALM", ">>> ALARM TRIGGERED <<<");
+      }
+      if (!match && isAlarmActive && (millis() - alarmStartTime >= 60000)) {
+        isAlarmActive = false; alarmSnoozed = false; ledcWrite(BUZZER, 0);
+      }
+    }
+    vTaskDelay(pdMS_TO_TICKS(30000));
+  }
+}
+
+// ═════════════════════════════════════════════
+//  SETUP
+// ═════════════════════════════════════════════
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  dbg("SETUP", "===== BOOT =====");
+  dbgf("SETUP", "Free heap: %d", ESP.getFreeHeap());
+
+  pinMode(BTN_NEXT, INPUT_PULLUP);
+  pinMode(BTN_PREV, INPUT_PULLUP);
+  pinMode(PIR_PIN,  INPUT);
+  pinMode(LED_HIGH, OUTPUT); digitalWrite(LED_HIGH, LOW);
+  pinMode(LED_MID,  OUTPUT); digitalWrite(LED_MID,  LOW);
+  pinMode(LED_LOW,  OUTPUT); digitalWrite(LED_LOW,  LOW);
+
+  ledcAttach(BUZZER, BUZZER_FREQ, BUZZER_RES);
+
+  SPI.begin(EPD_SCK, -1, EPD_MOSI, CS);
+  display.init(115200, true, 2, false);
+  display.setRotation(0);
+  dbg("SETUP", "Display ready");
+
+  // ✅ CREATE MUTEXES AND QUEUE FIRST — before BLE and WiFi
+  dataMutex    = xSemaphoreCreateMutex();
+  displayMutex = xSemaphoreCreateMutex();
+  wifiMutex    = xSemaphoreCreateMutex();
+  bleMsgMutex  = xSemaphoreCreateMutex();
+  displayQueue = xQueueCreate(10, sizeof(DisplayCommand));
+  dbg("SETUP", "Mutexes + queue created");
+
+  // ✅ BLE BEFORE WiFi — phone can discover immediately
+  initBLE();
+  dbg("SETUP", "BLE ready");
+
+  // ✅ WiFi after BLE
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  WiFi.setTxPower(WIFI_POWER_19_5dBm);
+  connectWiFi();
+
+  configTime(19800, 0, "pool.ntp.org", "time.nist.gov");
+  struct tm timeinfo;
+  int ntpRetry = 0;
+  while (!getLocalTime(&timeinfo) && ntpRetry < 20) {
+    dbgf("SETUP", "NTP %d/20", ++ntpRetry);
+    delay(500);
+  }
+  if (getLocalTime(&timeinfo)) {
+    char tbuf[40];
+    strftime(tbuf, sizeof(tbuf), "%d %b %Y %H:%M:%S", &timeinfo);
+    dbgf("SETUP", "NTP: %s", tbuf);
+  }
+
+  timeRefreshTimer = xTimerCreate("TimeRefresh", pdMS_TO_TICKS(60000),
+                                   pdTRUE, NULL, timerTimeRefreshCallback);
+  apiRefreshTimer  = xTimerCreate("APIRefresh",  pdMS_TO_TICKS(90000),
+                                   pdTRUE, NULL, timerAPIRefreshCallback);
+
+  attachInterrupt(digitalPinToInterrupt(BTN_NEXT), isrBtnNext, FALLING);
+  attachInterrupt(digitalPinToInterrupt(BTN_PREV), isrBtnPrev, FALLING);
+
+  // ✅ Add these 2 lines in setup() before xTaskCreatePinnedToCore calls:
+  analogReadResolution(12);
+  analogSetAttenuation(ADC_11db);
+  dbg("SETUP", "ADC configured");
+
+  esp_task_wdt_config_t wdt_config = {
+    .timeout_ms     = 30000,
+    .idle_core_mask = 0,
+    .trigger_panic  = true
+  };
+  esp_task_wdt_reconfigure(&wdt_config);
+
+  // ✅ Give battery task more stack — 4096 not 2048
+  xTaskCreatePinnedToCore(taskAPI,     "API",     8192, NULL, 2, &taskAPIHandle,     0);
+  xTaskCreatePinnedToCore(taskDisplay, "Display", 8192, NULL, 3, &taskDisplayHandle, 1);
+  xTaskCreatePinnedToCore(taskAlarm,   "Alarm",   4096, NULL, 2, &taskAlarmHandle,   0);
+  xTaskCreatePinnedToCore(taskPIR,     "PIR",     4096, NULL, 2, &taskPIRHandle,     0);
+  xTaskCreatePinnedToCore(taskBuzzer,  "Buzzer",  4096, NULL, 4, &taskBuzzerHandle,  0);
+  xTaskCreatePinnedToCore(taskBattery, "Battery", 4096, NULL, 1, &taskBatteryHandle, 0);
+  dbg("SETUP", "All tasks created");
+
+  dbgf("SETUP", "Free heap after: %d", ESP.getFreeHeap());
+}
+
+void loop() { vTaskDelete(NULL); }
