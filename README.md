@@ -18,4 +18,4 @@ AI-powered smart desk organiser using ESP32-S3 and e-paper display.
 - Solar panel
 
 ## Authors
-Lakha Singh Namdhari
+Lakha Singh 
